@@ -15,7 +15,12 @@ name: release
 
 on:
   push:
-    tags: ['v*']
+    # Only immutable SemVer tags fire a build — `v1.0.0`, `v1.0.0-rc1`,
+    # `v2.3.4`, etc. Floating major tags (`v1`, `v2`) skip release.yml
+    # entirely; action.yml's resolve step looks up the latest matching
+    # immutable release at consumer runtime, so the floating tag doesn't
+    # need its own release.
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
   workflow_dispatch:
     inputs:
       heat-ref:

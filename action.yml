@@ -101,6 +101,7 @@ runs:
       env:
         VERSION_INPUT: ${{ inputs.heatcheck-version }}
         ACTION_REF: ${{ github.action_ref }}
+        GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
         # Determine which Release to pull the binary from.
@@ -111,8 +112,28 @@ runs:
           ver="${ACTION_REF}"
         fi
         if [ -z "$ver" ] || [ "$ver" = "main" ]; then
-          echo "::error::No heatcheck-version resolved. Use 'uses: nchantarotwong/heatcheck-action@v1.0.0' (a tagged release), or pass 'heatcheck-version: v1.0.0' explicitly. The 'main' branch has no published binary."
+          echo "::error::No heatcheck-version resolved. Use 'uses: nchantarotwong/heatcheck-action@v1.0.0' (or @v1), or pass 'heatcheck-version: v1.0.0' explicitly. The 'main' branch has no published binary."
           exit 1
+        fi
+        # Floating major-version tag (e.g., @v1, @v2) — resolve to the
+        # latest matching immutable vX.Y.Z release. Only X.Y.Z releases
+        # ship binaries; floating tags exist as convenience pins for
+        # marketplace consumers. Without resolution the download path
+        # would 404. Skips drafts and prereleases (someone pinning @v1
+        # wants stable, not v1.1.0-rc2).
+        if echo "$ver" | grep -qE '^v[0-9]+$'; then
+          major="${ver#v}"
+          resolved=$(gh release list \
+                       --repo nchantarotwong/heatcheck-action \
+                       --limit 100 \
+                       --json tagName,isDraft,isPrerelease \
+                       --jq "[.[] | select(.isDraft == false) | select(.isPrerelease == false) | select(.tagName | test(\"^v${major}\\\\.[0-9]+\\\\.[0-9]+\$\"))] | .[0].tagName // empty")
+          if [ -z "$resolved" ]; then
+            echo "::error::Floating tag '$ver' has no matching v${major}.Y.Z release. Pin to a specific version like @v${major}.0.0 or check https://github.com/nchantarotwong/heatcheck-action/releases."
+            exit 1
+          fi
+          echo "Resolved floating tag $ver → $resolved"
+          ver="$resolved"
         fi
         # Determine asset name from runner OS + arch.
         os_part=""
