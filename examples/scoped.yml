@@ -1,0 +1,23 @@
+# Scoped-paths heatcheck workflow.
+# Drop into .github/workflows/heatcheck.yml.
+#
+# Scans only the directories that actually contain application code.
+# Skips tests, vendored deps, and codegen output. Faster than the
+# default '.' on large monorepos.
+
+name: heatcheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: nchantarotwong/heatcheck-action@v1
+        with:
+          paths: src api lib
+          upload-report: 'true'

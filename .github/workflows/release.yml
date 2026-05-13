@@ -1,0 +1,215 @@
+# Builds heatcheck binaries on tag push and uploads them as Release assets.
+# Maintainer-only — consumers download the prebuilt binaries via action.yml.
+#
+# Trigger: push of a tag matching v* (e.g., v1.0.0). workflow_dispatch
+# supports a pre-flight build without tagging.
+#
+# Matrix: Linux x86_64, Linux arm64, Darwin arm64. Each runner uses the
+# oldest supported OS image so the resulting binaries run on newer images
+# too (libc backward compat). Darwin x86_64 is unsupported.
+#
+# Requires `HEAT_PAT` and `HEAT_REPO` repository secrets pointing at the
+# heatcheck source repo.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      heat-ref:
+        description: 'Heat ref (commit SHA, branch, or tag) to build from.'
+        required: false
+        default: '21db5aa2863f05de097aca84300380ba9f7ab32b'
+      release-tag:
+        description: 'Release tag to upload to (for manual runs only). Skipped if empty.'
+        required: false
+        default: ''
+
+env:
+  HEAT_REF_DEFAULT: '21db5aa2863f05de097aca84300380ba9f7ab32b'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            asset: heatcheck-linux-x86_64
+          - runner: ubuntu-22.04-arm
+            asset: heatcheck-linux-arm64
+          - runner: macos-14
+            asset: heatcheck-darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out heatcheck-action
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install native build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          for attempt in 1 2; do
+            if sudo apt-get update -qq; then break; fi
+            if [ "$attempt" = "2" ]; then echo "::error::apt-get update failed twice"; exit 1; fi
+            sleep 3
+          done
+          sudo apt-get install -y -qq \
+            clang \
+            libcurl4-openssl-dev \
+            libsqlite3-dev \
+            libxml2-dev \
+            zlib1g-dev
+
+      - name: Install GNU coreutils (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          # Heat's bootstrap scripts use `timeout` (GNU coreutils). macOS
+          # ships BSD tools and Homebrew installs coreutils with a `g`
+          # prefix by default (gtimeout). Putting libexec/gnubin on PATH
+          # exposes the unprefixed names without conflicting with macOS
+          # system tools.
+          brew install --quiet coreutils
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+          # Sanity check — should print a path inside gnubin, not /usr/bin.
+          export PATH="$(brew --prefix coreutils)/libexec/gnubin:$PATH"
+          command -v timeout
+          timeout --version | head -1
+
+      - name: Resolve Heat ref
+        id: heat
+        env:
+          INPUT_REF: ${{ inputs.heat-ref }}
+        run: |
+          set -euo pipefail
+          # workflow_dispatch passes the input; tag push leaves it empty.
+          ref="${INPUT_REF:-${HEAT_REF_DEFAULT}}"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Building heatcheck from Heat @ $ref"
+
+      - name: Clone source repo
+        env:
+          HEAT_PAT: ${{ secrets.HEAT_PAT }}
+          HEAT_REPO: ${{ secrets.HEAT_REPO }}
+          HEAT_REF: ${{ steps.heat.outputs.ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HEAT_PAT:-}" ] || [ -z "${HEAT_REPO:-}" ]; then
+            echo "::error::HEAT_PAT and HEAT_REPO repository secrets must be set on the action repo."
+            exit 1
+          fi
+          git clone --depth 1 \
+            "https://x-access-token:${HEAT_PAT}@github.com/${HEAT_REPO}.git" Heat
+          cd Heat
+          git fetch --depth 1 origin "$HEAT_REF" 2>/dev/null \
+            || git fetch --depth 50 origin "$HEAT_REF" 2>/dev/null \
+            || git fetch origin
+          git checkout --quiet "$HEAT_REF"
+
+      - name: Bootstrap heatc + self-host rebuild + compile heatcheck
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          cd Heat
+          bash bootstrap/scripts/bootstrap_heatc.sh
+          bash bootstrap/scripts/heatc_rebuild.sh
+          mkdir -p ../out
+          /tmp/heatc heatcheck/heatcheck.heat -o "../out/${ASSET}" \
+            2>&1 | grep -vE 'warning: overriding|warning generated|^$' || true
+          test -x "../out/${ASSET}"
+
+      - name: Compute SHA256
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          cd out
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ASSET" > "${ASSET}.sha256"
+          else
+            shasum -a 256 "$ASSET" > "${ASSET}.sha256"
+          fi
+          cat "${ASSET}.sha256"
+
+      - name: Upload as job artifact (for cross-job collection)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            out/${{ matrix.asset }}
+            out/${{ matrix.asset }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # required to attach assets to a Release
+    steps:
+      - name: Check out repo (gh CLI needs a git workdir)
+        uses: actions/checkout@v4
+
+      - name: Determine release tag
+        id: tag
+        env:
+          REF: ${{ github.ref }}
+          DISPATCH_TAG: ${{ inputs.release-tag }}
+        run: |
+          set -euo pipefail
+          # Tag push: github.ref is "refs/tags/vX.Y.Z" → tag = vX.Y.Z.
+          # workflow_dispatch: take release-tag input (skip if empty).
+          if [ "${REF#refs/tags/}" != "${REF}" ]; then
+            tag="${REF#refs/tags/}"
+          elif [ -n "${DISPATCH_TAG:-}" ]; then
+            tag="${DISPATCH_TAG}"
+          else
+            echo "::notice::No release tag (manual run without release-tag input). Skipping publish."
+            echo "skip=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Download all build artifacts
+        if: steps.tag.outputs.skip != '1'
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage release files
+        if: steps.tag.outputs.skip != '1'
+        run: |
+          set -euo pipefail
+          mkdir -p release-files
+          # Each artifact lands in artifacts/<asset-name>/<files>.
+          find artifacts -type f \( -name 'heatcheck-*' -o -name 'heatcheck-*.sha256' \) \
+            -exec cp {} release-files/ \;
+          ls -la release-files/
+
+      - name: Create / update GitHub Release
+        if: steps.tag.outputs.skip != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Create the release if it doesn't exist; otherwise upload assets to existing.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists; uploading assets (--clobber)."
+            gh release upload "$TAG" release-files/* --clobber
+          else
+            echo "Creating Release $TAG."
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --notes "Automated release. See action.yml for runtime usage. SHA256 checksums attached." \
+              release-files/*
+          fi

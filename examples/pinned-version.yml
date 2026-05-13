@@ -1,0 +1,24 @@
+# Reproducible-CI heatcheck workflow.
+# Drop into .github/workflows/heatcheck.yml.
+#
+# Pins heatcheck to a specific patch release (e.g. v1.0.0) instead of
+# the floating major tag (v1). Same source + same patch version = same
+# scan result, indefinitely.
+#
+# When a new heatcheck-action release adds sinks or refines a sink's
+# accuracy, you'll see it as a tag bump on the releases page and can
+# update the @vX.Y.Z pin at your own cadence.
+
+name: heatcheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: nchantarotwong/heatcheck-action@v1.0.0

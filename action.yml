@@ -1,0 +1,272 @@
+name: 'heatcheck'
+description: 'Catch the injection bugs LLMs ship past green tests — static taint analysis for Python.'
+author: 'Nels Chantarotwong'
+branding:
+  icon: 'shield'
+  color: 'orange'
+
+inputs:
+  paths:
+    description: |
+      Space-separated paths to scan (files or directories). Default: . (the workspace root).
+      Note: paths cannot contain spaces — for multi-path scans use space-separated tokens
+      ("src tests/"). Heatcheck skips dotdirs (.git, .venv, .mypy_cache, ...) and __pycache__
+      automatically.
+    required: false
+    default: '.'
+  fail-on-violations:
+    description: 'Fail the workflow when any violation is found. Must be "true" or "false". Default: "true".'
+    required: false
+    default: 'true'
+  heatcheck-version:
+    description: |
+      Release tag of nchantarotwong/heatcheck-action to download the binary from.
+      Default: the action's own ref (e.g., "v1.0.0" when used as @v1.0.0).
+      Override only if you need to pin to a specific binary independently of the
+      action wrapper's version.
+    required: false
+    default: ''
+  python-version:
+    description: 'Python version on PATH (heatcheck calls CPython''s ast module).'
+    required: false
+    default: '3.11'
+  upload-report:
+    description: 'Upload .heatcheck/report.html as a workflow artifact. Must be "true" or "false". Default: "false".'
+    required: false
+    default: 'false'
+  timeout-seconds:
+    description: 'Per-run timeout for the heatcheck binary (seconds). Default: "600" (10 min).'
+    required: false
+    default: '600'
+
+outputs:
+  violations:
+    description: 'Number of violations found across all scanned files. "0" on clean run; "-1" on internal failure (no JSON produced).'
+    value: ${{ steps.run.outputs.violations }}
+  json-path:
+    description: 'Path to the raw JSON report on the runner filesystem.'
+    value: ${{ steps.run.outputs.json }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate inputs
+      shell: bash
+      env:
+        FAIL_ON_VIOLATIONS: ${{ inputs.fail-on-violations }}
+        UPLOAD_REPORT: ${{ inputs.upload-report }}
+        PATHS: ${{ inputs.paths }}
+        TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
+      run: |
+        set -euo pipefail
+        case "${RUNNER_OS:-}" in
+          Linux|macOS) ;;
+          Windows) echo "::error::heatcheck-action does not support Windows runners. Use ubuntu-latest or macos-latest."; exit 1;;
+          *) echo "::error::Unrecognized runner OS '${RUNNER_OS:-unset}'. Use ubuntu-latest or macos-latest."; exit 1;;
+        esac
+        if [ "${RUNNER_OS:-}" = "macOS" ] && [ "${RUNNER_ARCH:-}" = "X64" ]; then
+          echo "::error::macOS x86_64 runners aren't supported (no prebuilt binary). Use macos-latest (arm64) or ubuntu-latest."
+          exit 1
+        fi
+        bad=0
+        case "$FAIL_ON_VIOLATIONS" in
+          true|false) ;;
+          *) echo "::error::fail-on-violations must be 'true' or 'false' (got: '$FAIL_ON_VIOLATIONS')"; bad=1;;
+        esac
+        case "$UPLOAD_REPORT" in
+          true|false) ;;
+          *) echo "::error::upload-report must be 'true' or 'false' (got: '$UPLOAD_REPORT')"; bad=1;;
+        esac
+        if [ -z "$(echo "$PATHS" | tr -d '[:space:]')" ]; then
+          echo "::error::paths is empty — provide at least one path to scan (default '.' scans the workspace)"
+          bad=1
+        fi
+        if ! echo "$TIMEOUT_SECONDS" | grep -qE '^[0-9]+$'; then
+          echo "::error::timeout-seconds must be a non-negative integer (got: '$TIMEOUT_SECONDS')"
+          bad=1
+        fi
+        if [ -z "$(ls -A "$GITHUB_WORKSPACE" 2>/dev/null)" ]; then
+          echo "::warning::workspace at \$GITHUB_WORKSPACE is empty — did you forget 'uses: actions/checkout@v4' before this step?"
+        fi
+        [ "$bad" = "0" ] || exit 1
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Resolve target asset + version
+      id: resolve
+      shell: bash
+      env:
+        VERSION_INPUT: ${{ inputs.heatcheck-version }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: |
+        set -euo pipefail
+        # Determine which Release to pull the binary from.
+        # Priority: explicit input → github.action_ref (set by @vX.Y.Z usage)
+        # → fail with a clear error if neither yields a tagged version.
+        ver="${VERSION_INPUT}"
+        if [ -z "$ver" ]; then
+          ver="${ACTION_REF}"
+        fi
+        if [ -z "$ver" ] || [ "$ver" = "main" ]; then
+          echo "::error::No heatcheck-version resolved. Use 'uses: nchantarotwong/heatcheck-action@v1.0.0' (a tagged release), or pass 'heatcheck-version: v1.0.0' explicitly. The 'main' branch has no published binary."
+          exit 1
+        fi
+        # Determine asset name from runner OS + arch.
+        os_part=""
+        case "${RUNNER_OS:-}" in
+          Linux) os_part="linux";;
+          macOS) os_part="darwin";;
+          *) echo "::error::unexpected RUNNER_OS '$RUNNER_OS'"; exit 1;;
+        esac
+        arch_part=""
+        case "${RUNNER_ARCH:-}" in
+          X64) arch_part="x86_64";;
+          ARM64) arch_part="arm64";;
+          *) echo "::error::unsupported RUNNER_ARCH '$RUNNER_ARCH'"; exit 1;;
+        esac
+        asset="heatcheck-${os_part}-${arch_part}"
+        echo "version=$ver" >> "$GITHUB_OUTPUT"
+        echo "asset=$asset" >> "$GITHUB_OUTPUT"
+        echo "Will fetch $asset from heatcheck-action release $ver"
+
+    - name: Cache heatcheck binary
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/heatcheck-bin
+        # Cache by version + asset so a re-tag doesn't reuse a stale binary.
+        key: heatcheck-${{ steps.resolve.outputs.version }}-${{ steps.resolve.outputs.asset }}-v1
+
+    - name: Download heatcheck binary (cache miss)
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        VERSION: ${{ steps.resolve.outputs.version }}
+        ASSET: ${{ steps.resolve.outputs.asset }}
+        OUT_DIR: ${{ runner.temp }}/heatcheck-bin
+        # github.token is automatically scoped to the consuming repo, but
+        # heatcheck-action's Releases are PUBLIC so no auth is actually
+        # needed. We pass it anyway to lift the unauthenticated rate limit
+        # ceiling for high-volume orgs.
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$OUT_DIR"
+        cd "$OUT_DIR"
+
+        base="https://github.com/nchantarotwong/heatcheck-action/releases/download/${VERSION}"
+        echo "Downloading from $base"
+
+        for attempt in 1 2 3; do
+          if curl --fail --silent --show-error --location \
+                  --retry 3 --retry-delay 2 \
+                  -o "$ASSET"        "$base/$ASSET" \
+              && curl --fail --silent --show-error --location \
+                  --retry 3 --retry-delay 2 \
+                  -o "$ASSET.sha256" "$base/$ASSET.sha256"; then
+            break
+          fi
+          if [ "$attempt" = "3" ]; then
+            echo "::error::Failed to download $ASSET from heatcheck-action release $VERSION. Confirm the tag exists and assets are uploaded."
+            exit 1
+          fi
+          sleep $((attempt * 2))
+        done
+
+        # Verify SHA256.
+        if command -v sha256sum >/dev/null 2>&1; then
+          sha256sum -c "$ASSET.sha256"
+        else
+          # macOS: shasum -c needs the file in the same dir; already true.
+          shasum -a 256 -c "$ASSET.sha256"
+        fi
+
+        chmod +x "$ASSET"
+        ln -sf "$ASSET" heatcheck
+        ./heatcheck --version
+
+    - name: Run heatcheck
+      id: run
+      shell: bash
+      env:
+        HEATCHECK_BIN: ${{ runner.temp }}/heatcheck-bin/heatcheck
+        HEATCHECK_JSON: ${{ runner.temp }}/heatcheck.json
+        HEATCHECK_PATHS: ${{ inputs.paths }}
+        HEATCHECK_FAIL: ${{ inputs.fail-on-violations }}
+        HEATCHECK_UPLOAD: ${{ inputs.upload-report }}
+        HEATCHECK_TIMEOUT: ${{ inputs.timeout-seconds }}
+      run: |
+        set -uo pipefail
+        chmod +x "$HEATCHECK_BIN"
+        echo "json=$HEATCHECK_JSON" >> "$GITHUB_OUTPUT"
+
+        report_flag="--no-report"
+        if [ "$HEATCHECK_UPLOAD" = "true" ]; then
+          report_flag=""
+        fi
+
+        TIMEOUT_CMD=""
+        if command -v timeout >/dev/null 2>&1; then
+          TIMEOUT_CMD="timeout"
+        elif command -v gtimeout >/dev/null 2>&1; then
+          TIMEOUT_CMD="gtimeout"
+        else
+          echo "::warning::neither 'timeout' nor 'gtimeout' available; heatcheck runs without a per-scan timeout"
+        fi
+
+        set +e
+        # shellcheck disable=SC2086
+        if [ -n "$TIMEOUT_CMD" ]; then
+          "$TIMEOUT_CMD" "$HEATCHECK_TIMEOUT"s "$HEATCHECK_BIN" --json $report_flag $HEATCHECK_PATHS > "$HEATCHECK_JSON"
+        else
+          "$HEATCHECK_BIN" --json $report_flag $HEATCHECK_PATHS > "$HEATCHECK_JSON"
+        fi
+        rc=$?
+        set -e
+
+        if [ "$rc" = "124" ]; then
+          echo "::error::heatcheck exceeded the ${HEATCHECK_TIMEOUT}s timeout. Bump 'timeout-seconds' or narrow 'paths'."
+          echo "violations=-1" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+        if [ "$rc" = "2" ] || [ "$rc" = "64" ]; then
+          echo "::error::heatcheck exited with rc=$rc"
+          [ -s "$HEATCHECK_JSON" ] && head -c 4000 "$HEATCHECK_JSON" || true
+          echo "violations=-1" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+        fi
+
+        if ! python "${{ github.action_path }}/scripts/post_process.py" \
+              --json "$HEATCHECK_JSON" \
+              --workspace "$GITHUB_WORKSPACE" \
+              --summary "${GITHUB_STEP_SUMMARY:-/dev/null}"; then
+          echo "::error::post_process.py failed — JSON may be malformed."
+          echo "violations=-1" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        n=$(python -c '
+        import json, os
+        try:
+            with open(os.environ["HEATCHECK_JSON"]) as f:
+                print(len(json.load(f).get("violations", [])))
+        except Exception:
+            print("-1")
+        ' 2>/dev/null || echo "-1")
+        echo "violations=$n" >> "$GITHUB_OUTPUT"
+
+        if [ "$n" != "0" ] && [ "$n" != "-1" ] && [ "$HEATCHECK_FAIL" = "true" ]; then
+          exit 1
+        fi
+        exit 0
+
+    - name: Upload HTML report
+      if: ${{ always() && inputs.upload-report == 'true' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: heatcheck-report
+        path: .heatcheck/report.html
+        if-no-files-found: warn

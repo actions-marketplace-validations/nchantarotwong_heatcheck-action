@@ -1,0 +1,144 @@
+# Self-test for the action wrapper.
+#
+# Validates the local action.yml against fixtures with known expected
+# outcomes by downloading the latest published Release's binary.
+#
+# Until a Release exists (pre-v1.0.0), the action.yml's download step
+# will fail at the validation gate ("No heatcheck-version resolved...").
+# We discover the latest tag via `gh release list` and skip the suite
+# with a notice if there is none — so first-push CI on main is green
+# even before any release has been built.
+
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Discover the latest published release. If none exists yet, downstream
+  # jobs see latest='' and skip cleanly.
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      latest: ${{ steps.find.outputs.latest }}
+    steps:
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=$(gh release list --repo "${{ github.repository }}" --limit 1 \
+                  --json tagName --jq '.[0].tagName // ""')
+          echo "latest=$tag" >> "$GITHUB_OUTPUT"
+          if [ -z "$tag" ]; then
+            echo "::notice::No published release yet — test jobs will skip. Tag a release (e.g., v1.0.0-rc1) to enable end-to-end CI."
+          else
+            echo "Testing against release: $tag"
+          fi
+
+  # Fixture has a known SQL-injection. Action must detect it,
+  # produce a JSON report with violations > 0, and (with the default
+  # fail-on-violations='true') exit non-zero.
+  detects-violations:
+    needs: discover
+    if: needs.discover.outputs.latest != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create vulnerable fixture
+        run: |
+          mkdir -p test-fixtures/vulnerable
+          cat > test-fixtures/vulnerable/app.py <<'PY'
+          from flask import Flask, request
+          import sqlite3
+          app = Flask(__name__)
+          @app.route('/lookup')
+          def lookup():
+              name = request.args['name']
+              cur = sqlite3.connect('db').cursor()
+              return cur.execute(f"SELECT * FROM users WHERE name = '{name}'").fetchall()
+          PY
+
+      - id: scan
+        uses: ./
+        with:
+          paths: test-fixtures/vulnerable
+          fail-on-violations: 'false'
+          heatcheck-version: ${{ needs.discover.outputs.latest }}
+
+      - name: Assert violations detected
+        run: |
+          n="${{ steps.scan.outputs.violations }}"
+          echo "violations output: '$n'"
+          if [ "$n" = "0" ] || [ "$n" = "-1" ] || [ -z "$n" ]; then
+            echo "::error::expected violations > 0 on a vulnerable fixture, got '$n'"
+            exit 1
+          fi
+          test -s "${{ steps.scan.outputs.json-path }}"
+          python3 -c "
+          import json
+          d = json.load(open('${{ steps.scan.outputs.json-path }}'))
+          assert len(d.get('violations', [])) > 0, 'no violations in JSON'
+          print('OK: violations =', len(d['violations']))
+          "
+
+  # Fixture is clean — no violations, action must report 0 and rc=0
+  # with the default fail-on-violations='true'.
+  clean-fixture:
+    needs: discover
+    if: needs.discover.outputs.latest != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create clean fixture
+        run: |
+          mkdir -p test-fixtures/clean
+          cat > test-fixtures/clean/app.py <<'PY'
+          import sqlite3
+          def safe():
+              cur = sqlite3.connect('db').cursor()
+              cur.execute("SELECT 1")
+          PY
+
+      - id: scan
+        uses: ./
+        with:
+          paths: test-fixtures/clean
+          heatcheck-version: ${{ needs.discover.outputs.latest }}
+
+      - name: Assert clean
+        run: |
+          n="${{ steps.scan.outputs.violations }}"
+          if [ "$n" != "0" ]; then
+            echo "::error::expected 0 violations on a clean fixture, got '$n'"
+            exit 1
+          fi
+
+  # Input validation: an invalid fail-on-violations should fail-fast
+  # before any download work happens. Doesn't depend on a release.
+  rejects-invalid-input:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: scan
+        continue-on-error: true
+        uses: ./
+        with:
+          fail-on-violations: 'maybe'
+          # version arg is irrelevant — the validate step runs first.
+          heatcheck-version: 'v0.0.0-doesnt-exist'
+      - name: Assert action failed
+        run: |
+          if [ "${{ steps.scan.outcome }}" != "failure" ]; then
+            echo "::error::expected the action to fail on invalid fail-on-violations='maybe'"
+            exit 1
+          fi

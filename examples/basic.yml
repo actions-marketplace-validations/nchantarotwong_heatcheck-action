@@ -1,0 +1,20 @@
+# Minimal heatcheck workflow.
+# Drop into .github/workflows/heatcheck.yml.
+#
+# Runs on every push and pull request. Fails the job if any violation
+# is found. Violations show up as inline annotations on the PR Files
+# tab and as a workflow summary on the run page.
+
+name: heatcheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: nchantarotwong/heatcheck-action@v1

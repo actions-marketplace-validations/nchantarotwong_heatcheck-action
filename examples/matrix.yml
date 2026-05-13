@@ -1,0 +1,25 @@
+# Matrix-runner heatcheck workflow.
+# Drop into .github/workflows/heatcheck-matrix.yml.
+#
+# Scans on Linux x86_64 + macOS arm64 in parallel. Most projects
+# don't need this — heatcheck's analysis is deterministic per Heat
+# commit, so one runner is enough — but it's the smoke test pattern
+# we run on heatcheck itself.
+
+name: heatcheck (matrix)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  scan:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: nchantarotwong/heatcheck-action@v1

@@ -1,0 +1,23 @@
+# Advisory-mode heatcheck workflow.
+# Drop into .github/workflows/heatcheck-advisory.yml.
+#
+# Surfaces violations as annotations + a workflow summary, but never
+# fails the build. Useful when adopting heatcheck on an existing
+# codebase — you can see the backlog without blocking every PR.
+# Once the backlog is clean, flip fail-on-violations back to true.
+
+name: heatcheck (advisory)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: nchantarotwong/heatcheck-action@v1
+        with:
+          fail-on-violations: 'false'
