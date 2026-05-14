@@ -70,30 +70,90 @@ jobs:
           bash bootstrap/scripts/heatc_rebuild.sh || true
           ls -la /tmp/heatc
 
-      - name: Capture gdb backtrace at atexit crash
+      - name: Capture gdb backtrace + outer-list dump at crash
         run: |
           set -euo pipefail
           cd Heat
           cat > /tmp/gdb_commands.txt <<'GDB'
           set pagination off
           set confirm off
+          set print pretty on
           handle SIGSEGV stop print
           run bootstrap/heatc/heatc.heat -o /tmp/heatc_out --emit-ll
-          echo === FAULT BACKTRACE ===\n
+          echo \n=== FAULT BACKTRACE ===\n
           bt 50
-          echo === REGISTERS ===\n
+          echo \n=== REGISTERS ===\n
           info registers
-          echo === LOCALS IN TOP FRAME ===\n
+          echo \n=== INNER HEAT_LIST_RELEASE FRAME (#0) ===\n
+          frame 0
+          info args
           info locals
-          echo === CURRENT FRAME SOURCE ===\n
-          list
-          echo === ALL THREADS ===\n
+          # Bad list pointer is the inner heat_list_release's `list` arg.
+          # Cast it and try to read its struct — this read itself faults
+          # in the actual run, but gdb's `x/Nxw` is non-fatal so we get
+          # bytes back if the page IS readable.
+          echo \n--- bytes at 0x7fffeb0fd020 (inner ptr, expected unmapped) ---\n
+          # Read inner pointer from args dynamically.
+          set $inner = (struct HeatList *)$rdi
+          echo inner addr =
+          p/x $inner
+          # Probe whether the page is readable. If it faults, gdb prints
+          # `Cannot access memory at ...` and continues to next command.
+          echo \n--- inner->magic (expect LIST_HDR if magic match coincided) ---\n
+          p/x *((unsigned long *)$inner)
+          echo \n--- inner->elem_type (offset 32) ---\n
+          p ((struct HeatList *)$inner)->elem_type
+          echo \n--- inner->length (offset 16) ---\n
+          p ((struct HeatList *)$inner)->length
+
+          echo \n=== OUTER HEAT_LIST_RELEASE FRAME (frame 3) ===\n
+          # Frame 3 is the outer call with list=0x55555811e1b8.
+          # If the address changes across runs, we still get the right
+          # frame by name + parameter.
+          frame 3
+          info args
+          info locals
+          echo \n--- outer list struct ---\n
+          # Use the frame's `list` argument symbolically.
+          p *list
+          echo \n--- outer list elem_type ---\n
+          p list->elem_type
+          echo \n--- outer list length ---\n
+          p list->length
+          echo \n--- outer list capacity ---\n
+          p list->capacity
+          echo \n--- which index `i` is being walked at crash? ---\n
+          p i
+          echo \n--- data[i] (the value causing crash) ---\n
+          p/x list->data[i]
+          echo \n--- first 16 elements (or len, whichever smaller) ---\n
+          set $n = (list->length > 16) ? 16 : list->length
+          set $j = 0
+          while $j < $n
+            printf "  data[%ld] = 0x%lx\n", $j, list->data[$j]
+            set $j = $j + 1
+          end
+          echo \n--- last 4 elements ---\n
+          set $j = (list->length > 4) ? list->length - 4 : 0
+          while $j < list->length
+            printf "  data[%ld] = 0x%lx\n", $j, list->data[$j]
+            set $j = $j + 1
+          end
+
+          echo \n=== CHECK: is outer list address in known symbol table? ===\n
+          # Map elem_type to a likely Heat-source type:
+          #   1=String, 2=List, 4=Dict, 5=IDict, 7=Tagged, 8=Struct
+          # (per _heat_elem_type_is_pointer in heat_stdlib.c).
+          # The combination of elem_type + length + first-element value
+          # often pins down which heatc.heat local this is.
+          echo \nelem_type legend: 1=String 2=List 4=Dict 5=IDict 7=Tagged 8=Struct
+          echo \n=== ALL THREADS BT ===\n
           thread apply all bt 10
           quit
           GDB
           gdb -q -batch -x /tmp/gdb_commands.txt /tmp/heatc 2>&1 | tee /tmp/atexit-bt.log
           echo --- summary ---
-          grep -E '#[0-9]+|SIGSEGV|Program received|at /heat|in heat_' /tmp/atexit-bt.log | head -60
+          grep -E '#[0-9]+|SIGSEGV|Program received|elem_type|length|data\[|inner addr' /tmp/atexit-bt.log | head -80
 
       - name: Upload backtrace
         if: always()
