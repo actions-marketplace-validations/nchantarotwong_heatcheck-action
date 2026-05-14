@@ -78,75 +78,65 @@ jobs:
           set pagination off
           set confirm off
           set print pretty on
+          # Don't abort the script on memory-read errors — keep going so
+          # later commands still execute.
+          set unwindonsignal on
           handle SIGSEGV stop print
           run bootstrap/heatc/heatc.heat -o /tmp/heatc_out --emit-ll
           echo \n=== FAULT BACKTRACE ===\n
           bt 50
           echo \n=== REGISTERS ===\n
           info registers
-          echo \n=== INNER HEAT_LIST_RELEASE FRAME (#0) ===\n
-          frame 0
-          info args
-          info locals
-          # Bad list pointer is the inner heat_list_release's `list` arg.
-          # Cast it and try to read its struct — this read itself faults
-          # in the actual run, but gdb's `x/Nxw` is non-fatal so we get
-          # bytes back if the page IS readable.
-          echo \n--- bytes at 0x7fffeb0fd020 (inner ptr, expected unmapped) ---\n
-          # Read inner pointer from args dynamically.
-          set $inner = (struct HeatList *)$rdi
-          echo inner addr =
-          p/x $inner
-          # Probe whether the page is readable. If it faults, gdb prints
-          # `Cannot access memory at ...` and continues to next command.
-          echo \n--- inner->magic (expect LIST_HDR if magic match coincided) ---\n
-          p/x *((unsigned long *)$inner)
-          echo \n--- inner->elem_type (offset 32) ---\n
-          p ((struct HeatList *)$inner)->elem_type
-          echo \n--- inner->length (offset 16) ---\n
-          p ((struct HeatList *)$inner)->length
 
-          echo \n=== OUTER HEAT_LIST_RELEASE FRAME (frame 3) ===\n
-          # Frame 3 is the outer call with list=0x55555811e1b8.
-          # If the address changes across runs, we still get the right
-          # frame by name + parameter.
+          # --- OUTER FRAME FIRST (the actionable data) ---
+          echo \n=== OUTER HEAT_LIST_RELEASE FRAME (frame 3 — heap list being walked) ===\n
           frame 3
           info args
           info locals
-          echo \n--- outer list struct ---\n
-          # Use the frame's `list` argument symbolically.
-          p *list
-          echo \n--- outer list elem_type ---\n
-          p list->elem_type
+          echo \n--- outer list struct (full) ---\n
+          print *list
+          echo \n--- outer list elem_type (1=Str 2=List 4=Dict 5=IDict 7=Tagged 8=Struct) ---\n
+          print list->elem_type
           echo \n--- outer list length ---\n
-          p list->length
+          print list->length
           echo \n--- outer list capacity ---\n
-          p list->capacity
-          echo \n--- which index `i` is being walked at crash? ---\n
-          p i
-          echo \n--- data[i] (the value causing crash) ---\n
-          p/x list->data[i]
-          echo \n--- first 16 elements (or len, whichever smaller) ---\n
-          set $n = (list->length > 16) ? 16 : list->length
-          set $j = 0
-          while $j < $n
-            printf "  data[%ld] = 0x%lx\n", $j, list->data[$j]
-            set $j = $j + 1
-          end
-          echo \n--- last 4 elements ---\n
-          set $j = (list->length > 4) ? list->length - 4 : 0
-          while $j < list->length
-            printf "  data[%ld] = 0x%lx\n", $j, list->data[$j]
-            set $j = $j + 1
+          print list->capacity
+          echo \n--- which loop index `i` is being walked ---\n
+          print i
+          echo \n--- first 24 elements ---\n
+          python
+          import gdb
+          try:
+              lst = gdb.parse_and_eval("list")
+              n = int(lst["length"])
+              data = lst["data"]
+              # Print first min(n, 24) elements.
+              k = min(n, 24)
+              for j in range(k):
+                  v = int(data[j])
+                  cls = "heap" if 0x400000 <= v < 0x700000000000 else (
+                        "stack/hi" if 0x700000000000 <= v < 0x800000000000 else
+                        "lowjunk" if v < 0x1000 else "other")
+                  print(f"  data[{j}] = 0x{v:016x}  [{cls}]")
+              if n > 24:
+                  print(f"  ... ({n - 24} more)")
+              # Highlight any pointer in the suspect 0x7fff... range
+              flagged = [j for j in range(n) if 0x700000000000 <= int(data[j]) < 0x800000000000]
+              print(f"  flagged-suspect-indices = {flagged}")
+          except Exception as e:
+              print(f"python introspection failed: {e}")
           end
 
-          echo \n=== CHECK: is outer list address in known symbol table? ===\n
-          # Map elem_type to a likely Heat-source type:
-          #   1=String, 2=List, 4=Dict, 5=IDict, 7=Tagged, 8=Struct
-          # (per _heat_elem_type_is_pointer in heat_stdlib.c).
-          # The combination of elem_type + length + first-element value
-          # often pins down which heatc.heat local this is.
-          echo \nelem_type legend: 1=String 2=List 4=Dict 5=IDict 7=Tagged 8=Struct
+          # --- INNER FRAME (the unmapped pointer) ---
+          echo \n=== INNER HEAT_LIST_RELEASE FRAME (#0 — bad pointer) ===\n
+          frame 0
+          info args
+          echo \n--- raw bytes at inner ptr via x/gx (non-fatal) ---\n
+          x/4gx $rdi
+
+          echo \n=== /proc/self/maps around the bad page ===\n
+          shell cat /proc/$(pgrep -f /tmp/heatc | head -1)/maps 2>/dev/null | grep -E '^7fff[ce]' | head -20 || true
+
           echo \n=== ALL THREADS BT ===\n
           thread apply all bt 10
           quit
