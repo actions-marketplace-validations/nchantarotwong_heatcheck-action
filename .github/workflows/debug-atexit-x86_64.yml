@@ -71,6 +71,7 @@ jobs:
           ls -la /tmp/heatc
 
       - name: Capture gdb backtrace + outer-list dump at crash
+        continue-on-error: true
         run: |
           set -euo pipefail
           cd Heat
