@@ -70,26 +70,32 @@ jobs:
             done
             cd ../..
           fi
-          # Rebuild heatc binary with the new debug .o files. The
-          # fixpoint check might break because stage 0 (committed)
-          # has the pre-fix chained-dispatch UAFs that can corrupt
-          # the stage-1 IR. Stage 2 (built from stage 1 with the
-          # fixed runtime) should crash-free and produce clean IR.
-          # If fixpoint fails, we still want stage 2 binary on
-          # /tmp/heatc to run the actual verification on.
-          bash bootstrap/scripts/heatc_rebuild.sh 2>&1 | tail -40 || true
-          # Diagnose what stage2 files exist post-rebuild.
-          echo "--- stage 2 candidates ---"
-          ls -la /tmp/heatc-stage2* 2>&1 || echo "no stage 2 files"
-          # Find any binary (not .ll), newest first, install to /tmp/heatc.
-          newest_stage2=$(find /tmp -maxdepth 1 -name 'heatc-stage2-*' -not -name '*.ll' -type f -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}')
-          echo "newest_stage2=[$newest_stage2]"
-          if [ -n "$newest_stage2" ] && [ -x "$newest_stage2" ]; then
-            echo "  installing stage 2 manually: $newest_stage2 → /tmp/heatc"
-            cp "$newest_stage2" /tmp/heatc
-            chmod +x /tmp/heatc
+          # Run the bootstrap chain manually instead of heatc_rebuild.sh
+          # so we can install stage 2 even when the fixpoint check fails
+          # (heatc_rebuild.sh's EXIT trap deletes the stage 2 tempfile
+          # before we can grab it). The fixpoint break is expected on
+          # the first build after a fresh bootstrap with the fix —
+          # stage 0's pre-fix UAFs leak garbage into the stage-1 IR.
+          stage0_heatc=/tmp/heatc
+          stage1=/tmp/heatc-stage1
+          stage2=/tmp/heatc-stage2
+          echo "--- Stage 1: stage 0 compiles heatc.heat (tolerating SEGV) ---"
+          timeout 600s "$stage0_heatc" bootstrap/heatc/heatc.heat -o "$stage1" --emit-ll || \
+            echo "  stage 1 exited $? (tolerated — .ll on disk)"
+          ls -la "$stage1" "$stage1.ll" 2>&1 | head
+          echo "--- Stage 2: stage 1 (with fix linked in) compiles heatc.heat ---"
+          if [ -x "$stage1" ]; then
+            timeout 600s "$stage1" bootstrap/heatc/heatc.heat -o "$stage2" --emit-ll
+            echo "  stage 2 rc=$?"
           else
-            echo "  no installable stage 2 found — verification will run against stage 0"
+            echo "  stage 1 binary not built — stage 0 must have failed before linking"
+          fi
+          ls -la "$stage2" "$stage2.ll" 2>&1 | head
+          echo "--- Install stage 2 to /tmp/heatc for downstream verification ---"
+          if [ -x "$stage2" ]; then
+            cp "$stage2" /tmp/heatc
+            chmod +x /tmp/heatc
+            echo "  /tmp/heatc is now stage 2 (with fix)"
           fi
           ls -la /tmp/heatc
 
