@@ -70,8 +70,23 @@ jobs:
             done
             cd ../..
           fi
-          # Rebuild heatc binary with the new debug .o files
-          bash bootstrap/scripts/heatc_rebuild.sh || true
+          # Rebuild heatc binary with the new debug .o files. The
+          # fixpoint check might break because stage 0 (committed)
+          # has the pre-fix chained-dispatch UAFs that can corrupt
+          # the stage-1 IR. Stage 2 (built from stage 1 with the
+          # fixed runtime) should crash-free and produce clean IR.
+          # If fixpoint fails, we still want stage 2 binary on
+          # /tmp/heatc to run the actual verification on.
+          bash bootstrap/scripts/heatc_rebuild.sh 2>&1 | tail -40 || true
+          # If /tmp/heatc wasn't updated (fixpoint break = no cp),
+          # find stage 2 manually and put it in place. The temp
+          # paths are heatc-stage2-XXXXXX.YYYYYY (no extension).
+          newest_stage2=$(ls -t /tmp/heatc-stage2-*[!l] 2>/dev/null | head -1 || true)
+          if [ -n "$newest_stage2" ] && [ "$newest_stage2" -nt /tmp/heatc ]; then
+            echo "  installing stage 2 manually: $newest_stage2"
+            cp "$newest_stage2" /tmp/heatc
+            chmod +x /tmp/heatc
+          fi
           ls -la /tmp/heatc
 
       - name: Capture gdb backtrace + outer-list dump at crash
