@@ -35,14 +35,18 @@ jobs:
           HEAT_PAT: ${{ secrets.HEAT_PAT }}
         run: |
           set -euo pipefail
-          git clone --depth 1 \
-            "https://x-access-token:${HEAT_PAT}@github.com/${HEAT_REPO}.git" Heat
-          cd Heat
-          if [ "${{ inputs.heat-ref }}" != "main" ]; then
-            git fetch --depth 1 origin "${{ inputs.heat-ref }}" 2>/dev/null \
-              || git fetch origin
-            git checkout --quiet "${{ inputs.heat-ref }}"
+          # Clone the specific branch/ref directly with -b. Falls back to
+          # a full clone + checkout if -b doesn't accept the ref (sha,
+          # short branch like main/master is always fine).
+          ref="${{ inputs.heat-ref }}"
+          if ! git clone --depth 1 -b "$ref" \
+            "https://x-access-token:${HEAT_PAT}@github.com/${HEAT_REPO}.git" Heat 2>/dev/null; then
+            git clone "https://x-access-token:${HEAT_PAT}@github.com/${HEAT_REPO}.git" Heat
+            cd Heat
+            git checkout --quiet "$ref"
+            cd ..
           fi
+          cd Heat
           echo "Heat HEAD: $(git rev-parse HEAD)"
 
       - name: Build heatc with debug info
