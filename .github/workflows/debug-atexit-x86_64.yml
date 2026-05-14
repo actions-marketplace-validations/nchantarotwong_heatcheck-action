@@ -1,0 +1,104 @@
+# One-shot debug helper for Heat issue #839: heat_runtime_shutdown
+# atexit crash on Linux x86_64. Builds heatc on a native x86_64 GH
+# runner, then runs it under gdb to capture a backtrace + register
+# state at the crash site. Uploads the backtrace as a job artifact.
+#
+# Delete this workflow after the underlying bug is fixed.
+
+name: debug-atexit-x86_64
+
+on:
+  workflow_dispatch:
+    inputs:
+      heat-ref:
+        description: 'Heat ref to debug.'
+        required: false
+        default: 'main'
+
+env:
+  HEAT_REPO: nchantarotwong/Heat
+
+jobs:
+  bt:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install deps + gdb
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            clang gdb \
+            libcurl4-openssl-dev libsqlite3-dev libxml2-dev zlib1g-dev
+
+      - name: Clone Heat
+        env:
+          HEAT_PAT: ${{ secrets.HEAT_PAT }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 \
+            "https://x-access-token:${HEAT_PAT}@github.com/${HEAT_REPO}.git" Heat
+          cd Heat
+          if [ "${{ inputs.heat-ref }}" != "main" ]; then
+            git fetch --depth 1 origin "${{ inputs.heat-ref }}" 2>/dev/null \
+              || git fetch origin
+            git checkout --quiet "${{ inputs.heat-ref }}"
+          fi
+          echo "Heat HEAD: $(git rev-parse HEAD)"
+
+      - name: Build heatc with debug info
+        run: |
+          set -euo pipefail
+          cd Heat
+          bash bootstrap/scripts/bootstrap_heatc.sh
+          # Rebuild the runtime .o files with -g -O0 for clean backtraces.
+          # bootstrap_heatc.sh already ran build_runtime.sh, but in -O2.
+          # Override CFLAGS via env var if the script honors it; otherwise
+          # we'll patch in a manual rebuild loop.
+          if grep -q 'CFLAGS' bootstrap/scripts/build_runtime.sh; then
+            CFLAGS="-O0 -g" bash bootstrap/scripts/build_runtime.sh
+          else
+            # Build manually with debug flags
+            cd bootstrap/runtime
+            for src in *.c; do
+              [ "$src" = "test_chain_compat.c" ] && continue
+              [ -f "$src" ] && clang -O0 -g -c "$src" -o "${src%.c}.o" \
+                -I. -I/usr/include 2>&1 | grep -vE "warning|note:" | tail -3 || true
+            done
+            cd ../..
+          fi
+          # Rebuild heatc binary with the new debug .o files
+          bash bootstrap/scripts/heatc_rebuild.sh || true
+          ls -la /tmp/heatc
+
+      - name: Capture gdb backtrace at atexit crash
+        run: |
+          set -euo pipefail
+          cd Heat
+          cat > /tmp/gdb_commands.txt <<'GDB'
+          set pagination off
+          set confirm off
+          handle SIGSEGV stop print
+          run bootstrap/heatc/heatc.heat -o /tmp/heatc_out --emit-ll
+          echo === FAULT BACKTRACE ===\n
+          bt 50
+          echo === REGISTERS ===\n
+          info registers
+          echo === LOCALS IN TOP FRAME ===\n
+          info locals
+          echo === CURRENT FRAME SOURCE ===\n
+          list
+          echo === ALL THREADS ===\n
+          thread apply all bt 10
+          quit
+          GDB
+          gdb -q -batch -x /tmp/gdb_commands.txt /tmp/heatc 2>&1 | tee /tmp/atexit-bt.log
+          echo --- summary ---
+          grep -E '#[0-9]+|SIGSEGV|Program received|at /heat|in heat_' /tmp/atexit-bt.log | head -60
+
+      - name: Upload backtrace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atexit-backtrace
+          path: /tmp/atexit-bt.log
+          retention-days: 14
