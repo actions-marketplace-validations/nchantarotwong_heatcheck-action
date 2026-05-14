@@ -22,12 +22,12 @@ jobs:
   bt:
     runs-on: ubuntu-22.04
     steps:
-      - name: Install deps + gdb
+      - name: Install deps + gdb + valgrind
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            clang gdb \
+            clang gdb valgrind \
             libcurl4-openssl-dev libsqlite3-dev libxml2-dev zlib1g-dev
 
       - name: Clone Heat
@@ -145,10 +145,38 @@ jobs:
           echo --- summary ---
           grep -E '#[0-9]+|SIGSEGV|Program received|elem_type|length|data\[|inner addr' /tmp/atexit-bt.log | head -80
 
-      - name: Upload backtrace
+      - name: Run under valgrind to find dangling-alloc site
+        run: |
+          set -euo pipefail
+          cd Heat
+          # valgrind/memcheck tracks every alloc + free with a backtrace.
+          # For the invalid-read at the dangling pointer, it prints both:
+          #   - Address X is N bytes inside a block alloc'd at: [bt]
+          #   - Block was free'd at: [bt]
+          # The free bt is the answer to "which heat code released this
+          # string while the list still held it".
+          #
+          # --track-origins=yes adds origin tracking for uninit reads.
+          # --num-callers=30 deepens the backtrace so we see through any
+          # heat-runtime trampolines into the emitted code.
+          # Timeout generously — valgrind is ~20x slower than native.
+          timeout 600s valgrind \
+            --error-exitcode=0 \
+            --num-callers=30 \
+            --track-origins=yes \
+            --read-inline-info=yes \
+            --log-file=/tmp/valgrind.log \
+            /tmp/heatc bootstrap/heatc/heatc.heat -o /tmp/heatc_out2 --emit-ll \
+            2>&1 | tail -40 || true
+          echo --- valgrind summary ---
+          grep -E 'Invalid|Address|alloc.d at|free.d at|Process terminating|by 0x|at 0x' /tmp/valgrind.log | head -120 || true
+
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: atexit-backtrace
-          path: /tmp/atexit-bt.log
+          path: |
+            /tmp/atexit-bt.log
+            /tmp/valgrind.log
           retention-days: 14
