@@ -150,6 +150,30 @@ jobs:
           echo --- summary ---
           grep -E '#[0-9]+|SIGSEGV|Program received|elem_type|length|data\[|inner addr' /tmp/atexit-bt.log | head -80
 
+      - name: Verify built binary contains the fix
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          cd Heat
+          echo --- heat_safe_release disassembly ---
+          objdump -d --disassemble=heat_safe_release /tmp/heatc | head -60 || true
+          echo --- searching for LIST_MAGIC constant in heat_safe_release ---
+          # If my fix is compiled in, the magic 0x4C4953545F484452 should
+          # appear within heat_safe_release. The OLD code didn't reference
+          # this constant directly inside heat_safe_release — only inside
+          # heat_list_release.
+          objdump -d --disassemble=heat_safe_release /tmp/heatc | grep -iE '4c4953545f484452|list_hdr' | head -5 || true
+          echo --- heat_safe_release size (bytes) ---
+          objdump -t /tmp/heatc | grep -E ' F .text.*heat_safe_release' | head -2 || true
+          echo --- runtime obj heat_safe_release size ---
+          # The .o file used for linking
+          file bootstrap/runtime/heat_stdlib.o
+          objdump -t bootstrap/runtime/heat_stdlib.o | grep -E 'heat_safe_release' || true
+          echo --- heat_stdlib.c head: verify my fix is in the .c source ---
+          grep -n 'HEAT_LIST_MAGIC.*=.*LIST_HDR\|0x4C4953545F484452' bootstrap/runtime/heat_stdlib.c | head -10
+          echo --- exit status of grep ---
+          grep -c '0x4C4953545F484452' bootstrap/runtime/heat_stdlib.c || true
+
       - name: Run under valgrind to find dangling-alloc site
         run: |
           set -euo pipefail
