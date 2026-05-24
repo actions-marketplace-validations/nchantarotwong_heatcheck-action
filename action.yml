@@ -39,7 +39,22 @@ inputs:
     required: false
     default: '600'
 
+  upload-sarif:
+    description: |
+      Upload results to GitHub Code Scanning (the Security tab) as SARIF.
+      Tolerant: if the job lacks `security-events: write`, or the run is a
+      pull request from a fork, heatcheck warns and continues — it never
+      fails the build. Must be "true" or "false". Default: "true".
+    default: 'true'
+
+  sarif-category:
+    description: 'Code Scanning category (SARIF automationDetails.id) so heatcheck''s alerts coexist with other SAST tools instead of overwriting them. Default: "heatcheck".'
+    default: 'heatcheck'
+
 outputs:
+  sarif-path:
+    description: 'Path to the generated SARIF file on the runner (empty if upload-sarif is false or generation failed).'
+    value: ${{ steps.sarif.outputs.path }}
   violations:
     description: 'Number of violations found across all scanned files. "0" on clean run; "-1" on internal failure (no JSON produced).'
     value: ${{ steps.run.outputs.violations }}
@@ -55,6 +70,7 @@ runs:
       env:
         FAIL_ON_VIOLATIONS: ${{ inputs.fail-on-violations }}
         UPLOAD_REPORT: ${{ inputs.upload-report }}
+        UPLOAD_SARIF: ${{ inputs.upload-sarif }}
         PATHS: ${{ inputs.paths }}
         TIMEOUT_SECONDS: ${{ inputs.timeout-seconds }}
       run: |
@@ -76,6 +92,10 @@ runs:
         case "$UPLOAD_REPORT" in
           true|false) ;;
           *) echo "::error::upload-report must be 'true' or 'false' (got: '$UPLOAD_REPORT')"; bad=1;;
+        esac
+        case "$UPLOAD_SARIF" in
+          true|false) ;;
+          *) echo "::error::upload-sarif must be 'true' or 'false' (got: '$UPLOAD_SARIF')"; bad=1;;
         esac
         if [ -z "$(echo "$PATHS" | tr -d '[:space:]')" ]; then
           echo "::error::paths is empty — provide at least one path to scan (default '.' scans the workspace)"
@@ -283,6 +303,93 @@ runs:
           exit 1
         fi
         exit 0
+
+    - name: Code Scanning (SARIF)
+      id: sarif
+      if: ${{ always() && inputs.upload-sarif == 'true' }}
+      shell: bash
+      env:
+        HEATCHECK_BIN: ${{ runner.temp }}/heatcheck-bin/heatcheck
+        HEATCHECK_SARIF: ${{ runner.temp }}/heatcheck.sarif
+        HEATCHECK_PATHS: ${{ inputs.paths }}
+        HEATCHECK_TIMEOUT: ${{ inputs.timeout-seconds }}
+        SARIF_CATEGORY: ${{ inputs.sarif-category }}
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+        SHA: ${{ github.sha }}
+        REF: ${{ github.ref }}
+        EVENT_NAME: ${{ github.event_name }}
+        IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+      run: |
+        set -uo pipefail
+        warn(){ echo "::warning::heatcheck Code Scanning: $1"; printf '⚠️ heatcheck — Code Scanning upload skipped: %s\n' "$1" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"; }
+
+        # Generate SARIF (separate output mode; timeout-guarded). heatcheck is
+        # fast, so this second pass is cheap.
+        TIMEOUT_CMD=""
+        command -v timeout >/dev/null 2>&1 && TIMEOUT_CMD=timeout
+        if [ -z "$TIMEOUT_CMD" ] && command -v gtimeout >/dev/null 2>&1; then TIMEOUT_CMD=gtimeout; fi
+        set +e
+        # shellcheck disable=SC2086
+        if [ -n "$TIMEOUT_CMD" ]; then
+          "$TIMEOUT_CMD" "${HEATCHECK_TIMEOUT}"s "$HEATCHECK_BIN" --sarif --no-report $HEATCHECK_PATHS > "$HEATCHECK_SARIF"
+        else
+          "$HEATCHECK_BIN" --sarif --no-report $HEATCHECK_PATHS > "$HEATCHECK_SARIF"
+        fi
+        gen_rc=$?
+        set -e
+        # heatcheck exit codes: 0=clean, 1=violations found (the main case to
+        # surface!), 3=nothing conclusively analyzed — all three still produce a
+        # valid SARIF report. Only 2/64 (internal error) or 124 (timeout), or an
+        # empty file, are real generation failures.
+        if [ "$gen_rc" = "2" ] || [ "$gen_rc" = "64" ] || [ "$gen_rc" = "124" ] || [ ! -s "$HEATCHECK_SARIF" ]; then
+          warn "SARIF generation failed (rc=$gen_rc)."
+          echo "path=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "path=$HEATCHECK_SARIF" >> "$GITHUB_OUTPUT"
+
+        # Fork PRs can't write security-events (GitHub restriction) — skip,
+        # don't fail. The PR still gets inline annotations from the run step.
+        if [ "${EVENT_NAME:-}" = "pull_request" ] && [ "${IS_FORK:-}" = "true" ]; then
+          warn "pull request from a fork — GitHub blocks Code Scanning upload from forks."
+          exit 0
+        fi
+
+        # Build the upload request body with Python — already required by
+        # heatcheck (it shells out to CPython's ast module), so no jq
+        # dependency, guaranteed present, and correct JSON escaping. The script
+        # injects the Code Scanning category, gzip+base64-encodes the SARIF, and
+        # writes the body via files (no ARG_MAX limit on large reports).
+        # Tolerant: any failure warns and skips the upload — never fails build.
+        tmp="${RUNNER_TEMP:-/tmp}"
+        body="$tmp/heatcheck.sarif.body.json"
+        set +e
+        python "${{ github.action_path }}/scripts/sarif_body.py" \
+          --sarif "$HEATCHECK_SARIF" --out "$body" \
+          --commit-sha "$SHA" --ref "$REF" --category "${SARIF_CATEGORY:-}" \
+          2> "$tmp/sarif_body_err"
+        build_rc=$?
+        set -e
+        if [ "$build_rc" != "0" ] || [ ! -s "$body" ]; then
+          warn "could not build the SARIF upload body ($(head -c 200 "$tmp/sarif_body_err" 2>/dev/null | tr '\n' ' '))."
+          exit 0
+        fi
+
+        # Upload via the REST API, tolerantly: a missing 'security-events:
+        # write' permission (or any API error) WARNS and continues — it never
+        # breaks the build.
+        set +e
+        gh api --method POST "/repos/${GH_REPO}/code-scanning/sarifs" \
+          --input "$body" \
+          > /dev/null 2> "$tmp/sarif_upload_err"
+        up_rc=$?
+        set -e
+        if [ "$up_rc" != "0" ]; then
+          warn "$(head -c 240 "$tmp/sarif_upload_err" 2>/dev/null | tr '\n' ' '). Grant 'permissions: security-events: write' to populate the Security tab."
+          exit 0
+        fi
+        printf '✅ heatcheck — uploaded SARIF to Code Scanning (Security tab).\n' >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
     - name: Upload HTML report
       if: ${{ always() && inputs.upload-report == 'true' }}
