@@ -11,6 +11,18 @@ Pin to a floating `@v1` for auto-bumps within v1.x, or an immutable
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-06-14
+
+### Fixed
+- **HC-001 false positive on `safe_join` eliminated.** `safe_join`,
+  `routes_safe_join` (Gradio's module-level alias), and any attribute-form
+  `*.safe_join` (werkzeug, Flask re-exports) are now recognized as HC-001
+  launderers. Paths routed through these helpers are no longer flagged as path
+  traversal. Surfaced by a real scan of Gradio — the `/custom_component`
+  handler (routes.py:1033) was a false positive; the true finding at
+  routes.py:2210 (`undo_vibe_edit`) continues to fire correctly.
+  Four self-test canaries added (3 no-FP + 1 real-bug-fires).
+
 ## [1.8.0] - 2026-05-24
 
 ### Added
